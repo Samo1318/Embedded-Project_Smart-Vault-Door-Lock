@@ -1,0 +1,876 @@
+## Source Code
+/*
+* ATmega328p - Keypad Authentication with I2C LCD and RFID
+* LCD: SDA → PC4, SCL → PC5 (I2C Address: 0x3F)
+* Keypad on PCF8574 (I2C Address: 0x20)
+* RFID: SS → PB2, RST → PD2
+* Solenoid/Relay on PD4
+* Exit Button on PB0
+*/
+#include <avr/io.h>
+#include <util/delay.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
+// LCD configuration
+#define LCD_ADDR 0x3F
+#define LCD_ROWS 2
+#define LCD_COLS 16
+// PCF8574 Keypad configuration
+#define KEYPAD_PCF8574_ADDR 0x20 // Keypad address (A0-A2 grounded)
+// RFID Pins
+#define SS_PIN PB2 // Pin 16
+#define RST_PIN PD2 // Pin 4
+
+// Solenoid configuration - CHANGED TO PD4
+#define SOLENOID_PIN PD4
+#define SOLENOID_DDR DDRD
+#define SOLENOID_PORT PORTD
+// Exit Button configuration
+#define EXIT_BUTTON_PIN PB0
+#define EXIT_BUTTON_DDR DDRB
+#define EXIT_BUTTON_PORT PORTB
+#define EXIT_BUTTON_PIN_REG PINB
+// Your specific card UID (Correct Tag)
+#define YOUR_TAG_UID_0 0xE3
+#define YOUR_TAG_UID_1 0x38
+#define YOUR_TAG_UID_2 0xA1
+#define YOUR_TAG_UID_3 0x2C
+// Wrong Card UID
+#define WRONG_CARD_UID_0 0xE3
+#define WRONG_CARD_UID_1 0x9B
+#define WRONG_CARD_UID_2 0x43
+#define WRONG_CARD_UID_3 0x02
+// LED and Buzzer configuration
+#define RED_LED PC0 // Red LED on PC0
+#define YELLOW_LED PC1 // Yellow LED on PC1
+#define BUZZER PC2 // Buzzer on PC2
+#define LED_DDR DDRC
+#define LED_PORT PORTC
+
+// MFRC522 Register Definitions
+#define MFRC522_REG_COMMAND 0x01
+#define MFRC522_REG_COMM_IE_N 0x02
+#define MFRC522_REG_COMM_IRQ 0x04
+#define MFRC522_REG_DIV_IRQ 0x05
+#define MFRC522_REG_ERROR 0x06
+#define MFRC522_REG_STATUS1 0x07
+#define MFRC522_REG_STATUS2 0x08
+#define MFRC522_REG_FIFO_DATA 0x09
+#define MFRC522_REG_FIFO_LEVEL 0x0A
+#define MFRC522_REG_CONTROL 0x0C
+#define MFRC522_REG_BIT_FRAMING 0x0D
+#define MFRC522_REG_MODE 0x11
+#define MFRC522_REG_TX_MODE 0x12
+#define MFRC522_REG_RX_MODE 0x13
+#define MFRC522_REG_TX_CONTROL 0x14
+#define MFRC522_REG_TX_AUTO 0x15
+#define MFRC522_REG_T_MODE 0x2A
+#define MFRC522_REG_T_PRESCALER 0x2B
+#define MFRC522_REG_T_RELOAD_L 0x2C
+#define MFRC522_REG_T_RELOAD_H 0x2D
+#define MFRC522_REG_CRC_RESULT_L 0x21
+#define MFRC522_REG_CRC_RESULT_M 0x22
+#define MFRC522_REG_VERSION 0x37
+// MFRC522 Command Definitions
+#define PCD_IDLE 0x00
+#define PCD_AUTHENT 0x0E
+
+#define PCD_RECEIVE 0x08
+#define PCD_TRANSMIT 0x04
+#define PCD_TRANSCEIVE 0x0C
+#define PCD_RESETPHASE 0x0F
+#define PCD_CALCCRC 0x03
+
+// Mifare Commands
+#define PICC_CMD_REQA 0x26
+#define PICC_CMD_WUPA 0x52
+#define PICC_ANTICOLL 0x93
+#define PICC_SElECTTAG 0x93
+#define PICC_AUTHENT1A 0x60
+#define PICC_AUTHENT1B 0x61
+#define PICC_READ 0x30
+#define PICC_WRITE 0xA0
+#define PICC_DECREMENT 0xC0
+#define PICC_INCREMENT 0xC1
+#define PICC_RESTORE 0xC2
+#define PICC_TRANSFER 0xB0
+#define PICC_HALT 0x50
+// Status codes
+#define MI_OK 0
+#define MI_NOTAGERR 1
+#define MI_ERR 2
+// Keypad mapping for your layout
+const char keymap[4][4] = {
+ {'1', '2', '3', 'A'}, // Row 0
+ {'4', '5', '6', 'B'}, // Row 1
+ {'7', '8', '9', 'C'}, // Row 2
+ {'*', '0', '#', 'D'} // Row 3
+};
+
+// Correct PIN (4 digits + 2 letters)
+const char correct_pin[] = "0131AD";
+// Global variables
+uint8_t pin_authenticated = 0;
+uint8_t system_locked = 0;
+uint8_t failed_keypad_attempts = 0;
+uint8_t failed_rfid_attempts = 0;
+// Function prototypes
+void I2C_init(void);
+void I2C_start(void);
+void I2C_stop(void);
+void I2C_write(uint8_t data);
+uint8_t I2C_read(uint8_t ack);
+void LCD_sendNibble(uint8_t data);
+void LCD_sendByte(uint8_t value, uint8_t mode);
+void LCD_cmd(uint8_t cmd);
+void LCD_data(uint8_t data);
+void LCD_init(void);
+void LCD_setCursor(uint8_t col, uint8_t row);
+void LCD_print(const char *str);
+void LCD_printf(const char *fmt, ...);
+void LCD_clear(void);
+
+void keypad_init(void);
+char keypad_getkey(void);
+void displayEnterPin(void);
+void displayWrongPassword(uint8_t attempts);
+void displayAccessGranted(void);
+void displaySystemLocked(void);
+void displayRFIDScan(void);
+void displayRFIDSuccess(void);
+void displayRFIDFail(void);
+void displayWrongRFID(void);
+void displayWrongCard(void);
+void displayRFIDAttempts(uint8_t attempts);
+void initSPI(void);
+void SPI_send(uint8_t data);
+uint8_t SPI_receive(void);
+void MFRC522_Init(void);
+void MFRC522_Reset(void);
+void MFRC522_WriteRegister(uint8_t addr, uint8_t val);
+uint8_t MFRC522_ReadRegister(uint8_t addr);
+void MFRC522_SetBitMask(uint8_t reg, uint8_t mask);
+void MFRC522_ClearBitMask(uint8_t reg, uint8_t mask);
+void MFRC522_AntennaOn(void);
+uint8_t MFRC522_Request(uint8_t reqMode, uint8_t *TagType);
+uint8_t MFRC522_ToCard(uint8_t command, uint8_t *sendData, uint8_t sendLen, uint8_t *backData,
+uint16_t *backLen);
+uint8_t MFRC522_Anticoll(uint8_t *serNum);
+uint8_t checkRFID(void);
+void buzzer_on(void);
+void buzzer_off(void);
+
+void controlSolenoid(uint8_t state);
+uint8_t isExitButtonPressed(void);
+void handleExitButton(void);
+// I2C functions
+void I2C_init(void) {
+ TWSR = 0x00;
+ TWBR = 72;
+ TWCR = (1<<TWEN);
+}
+void I2C_start(void) {
+ TWCR = (1<<TWINT) | (1<<TWSTA) | (1<<TWEN);
+ while (!(TWCR & (1<<TWINT)));
+}
+void I2C_stop(void) {
+ TWCR = (1<<TWINT) | (1<<TWSTO) | (1<<TWEN);
+ _delay_us(10);
+}
+void I2C_write(uint8_t data) {
+ TWDR = data;
+ TWCR = (1<<TWINT) | (1<<TWEN);
+ while (!(TWCR & (1<<TWINT)));
+}
+uint8_t I2C_read(uint8_t ack) {
+ TWCR = (1<<TWINT) | (1<<TWEN) | (ack ? (1<<TWEA) : 0);
+
+ while (!(TWCR & (1<<TWINT)));
+ return TWDR;
+}
+// LCD functions
+void LCD_sendNibble(uint8_t data) {
+ I2C_start();
+ I2C_write(LCD_ADDR << 1);
+ I2C_write(data | 0x08);
+ I2C_write((data & ~0x04) | 0x08);
+ I2C_stop();
+ _delay_us(50);
+}
+void LCD_sendByte(uint8_t value, uint8_t mode) {
+ uint8_t high = (value & 0xF0) | (mode ? 0x01 : 0) | 0x08;
+ uint8_t low = ((value << 4) & 0xF0) | (mode ? 0x01 : 0) | 0x08;
+ LCD_sendNibble(high | 0x04);
+ LCD_sendNibble(low | 0x04);
+}
+void LCD_cmd(uint8_t cmd) {
+ LCD_sendByte(cmd, 0);
+ if (cmd == 0x01 || cmd == 0x02) _delay_ms(2);
+}
+void LCD_data(uint8_t data) {
+ LCD_sendByte(data, 1);
+}
+
+void LCD_init(void) {
+ _delay_ms(50);
+ LCD_cmd(0x33);
+ LCD_cmd(0x32);
+ LCD_cmd(0x28);
+ LCD_cmd(0x0C);
+ LCD_cmd(0x06);
+ LCD_cmd(0x01);
+ _delay_ms(2);
+}
+void LCD_setCursor(uint8_t col, uint8_t row) {
+ uint8_t row_offsets[] = {0x00, 0x40};
+ LCD_cmd(0x80 | (col + row_offsets[row]));
+}
+void LCD_print(const char *str) {
+ while (*str) LCD_data(*str++);
+}
+void LCD_printf(const char *fmt, ...) {
+ char buffer[32];
+ va_list args;
+ va_start(args, fmt);
+ vsnprintf(buffer, sizeof(buffer), fmt, args);
+ va_end(args);
+
+ char *p = buffer;
+
+ while (*p) {
+ LCD_data(*p++);
+ }
+}
+void LCD_clear(void) {
+ LCD_cmd(0x01);
+ _delay_ms(2);
+}
+// Keypad functions for PCF8574
+void keypad_init(void) {
+ // No initialization needed for PCF8574
+}
+char keypad_getkey(void) {
+ static uint8_t key_pressed = 0;
+ char key = 0;
+
+ // Scan each row using PCF8574
+ for (uint8_t row = 0; row < 4; row++) {
+ // Set all rows high (inactive), columns as inputs with pull-ups
+ uint8_t output_byte = 0xFF;
+
+ // Set current row low (active)
+ output_byte &= ~(1 << row);
+
+ // Write to keypad PCF8574
+ I2C_start();
+
+ I2C_write(KEYPAD_PCF8574_ADDR << 1);
+ I2C_write(output_byte);
+ I2C_stop();
+
+ _delay_us(10); // Small delay for stabilization
+
+ // Read from keypad PCF8574
+ I2C_start();
+ I2C_write((KEYPAD_PCF8574_ADDR << 1) | 1);
+ uint8_t input_byte = I2C_read(0); // Read with NACK
+ I2C_stop();
+
+ // Check each column
+ for (uint8_t col = 0; col < 4; col++) {
+ if (!(input_byte & (1 << (col + 4)))) {
+ // Simple debounce
+ _delay_ms(20);
+
+ // Read again to confirm
+ I2C_start();
+ I2C_write((KEYPAD_PCF8574_ADDR << 1) | 1);
+ input_byte = I2C_read(0);
+ I2C_stop();
+
+ if (!(input_byte & (1 << (col + 4)))) {
+ key = keymap[row][col];
+
+ // Wait for key release
+ uint8_t released = 0;
+
+ while (!released) {
+ I2C_start();
+ I2C_write((KEYPAD_PCF8574_ADDR << 1) | 1);
+ input_byte = I2C_read(0);
+ I2C_stop();
+
+ if (input_byte & (1 << (col + 4))) {
+ released = 1;
+ }
+ }
+
+ // Only return key if it's a new press
+ if (!key_pressed) {
+ key_pressed = 1;
+ return key;
+ }
+ }
+ }
+ }
+ }
+
+ // No key pressed
+ key_pressed = 0;
+ return 0;
+}
+// Display functions
+void displayEnterPin(void) {
+ LCD_clear();
+
+ LCD_setCursor(0, 0);
+ LCD_print("Enter PIN:");
+ LCD_setCursor(0, 1);
+ LCD_print(" "); // Clear the PIN display area (6 spaces)
+}
+void displayWrongPassword(uint8_t attempts) {
+ LCD_clear();
+ LCD_setCursor(0, 0);
+ LCD_print("WRONG PASSWORD!");
+ LCD_setCursor(0, 1);
+ LCD_print("Attempts: ");
+ LCD_data('0' + attempts);
+ LCD_print("/3");
+ _delay_ms(2000);
+}
+void displayAccessGranted(void) {
+ LCD_clear();
+ LCD_setCursor(0, 0);
+ LCD_print("ACCESS GRANTED");
+ LCD_setCursor(0, 1);
+ LCD_print("Scan RFID Card");
+ _delay_ms(2000);
+}
+void displaySystemLocked(void) {
+ LCD_clear();
+ LCD_setCursor(0, 0);
+
+ LCD_print("SYSTEM LOCKED");
+ LCD_setCursor(0, 1);
+ LCD_print("3 attempts failed");
+ _delay_ms(3000);
+}
+void displayRFIDScan(void) {
+ LCD_clear();
+ LCD_setCursor(0, 0);
+ LCD_print("Scan RFID Card");
+ LCD_setCursor(0, 1);
+ LCD_print("Attempts: ");
+ LCD_data('0' + failed_rfid_attempts);
+ LCD_print("/3");
+}
+void displayRFIDSuccess(void) {
+ LCD_clear();
+ LCD_setCursor(0, 0);
+ LCD_print("RFID Accepted!");
+ LCD_setCursor(0, 1);
+ LCD_print("Welcome!");
+}
+void displayRFIDFail(void) {
+ LCD_clear();
+ LCD_setCursor(0, 0);
+ LCD_print("RFID Rejected!");
+ LCD_setCursor(0, 1);
+
+ LCD_print("Try again");
+ _delay_ms(2000);
+}
+void displayWrongRFID(void) {
+ LCD_clear();
+ LCD_setCursor(0, 0);
+ LCD_print("WRONG RFID!");
+ LCD_setCursor(0, 1);
+ LCD_print("Try again");
+ _delay_ms(2000);
+}
+void displayWrongCard(void) {
+ LCD_clear();
+ LCD_setCursor(0, 0);
+ LCD_print("WRONG CARD!");
+ LCD_setCursor(0, 1);
+ LCD_print("Use correct RFID");
+ _delay_ms(2000);
+}
+void displayRFIDAttempts(uint8_t attempts) {
+ LCD_setCursor(10, 1);
+ LCD_data('0' + attempts);
+ LCD_print("/3");
+}
+void displayExitMessage(void) {
+
+ LCD_clear();
+ LCD_setCursor(0, 0);
+ LCD_print("EXIT BUTTON");
+ LCD_setCursor(0, 1);
+ LCD_print("Door Opening...");
+}
+// SPI Functions
+void initSPI(void) {
+ // Set MOSI, SCK, and SS as output, MISO as input
+ DDRB = (1 << PB3) | (1 << PB5) | (1 << PB2); // MOSI, SCK, SS as outputs
+ DDRB &= ~(1 << PB4); // MISO as input
+
+ // Enable SPI, Set as Master, Clock rate fck/16
+ SPCR = (1 << SPE) | (1 << MSTR) | (1 << SPR0);
+
+ // Set SS pin high initially
+ PORTB |= (1 << SS_PIN);
+}
+void SPI_send(uint8_t data) {
+ SPDR = data;
+ while (!(SPSR & (1 << SPIF)));
+}
+uint8_t SPI_receive(void) {
+ // Send dummy byte to receive data
+ SPDR = 0xFF;
+ while (!(SPSR & (1 << SPIF)));
+
+ return SPDR;
+}
+// MFRC522 Functions
+void MFRC522_WriteRegister(uint8_t addr, uint8_t val) {
+ PORTB &= ~(1 << SS_PIN);
+ SPI_send((addr << 1) & 0x7E);
+ SPI_send(val);
+ PORTB |= (1 << SS_PIN);
+}
+uint8_t MFRC522_ReadRegister(uint8_t addr) {
+ PORTB &= ~(1 << SS_PIN);
+ SPI_send(((addr << 1) & 0x7E) | 0x80);
+ uint8_t val = SPI_receive();
+ PORTB |= (1 << SS_PIN);
+ return val;
+}
+void MFRC522_SetBitMask(uint8_t reg, uint8_t mask) {
+ MFRC522_WriteRegister(reg, MFRC522_ReadRegister(reg) | mask);
+}
+void MFRC522_ClearBitMask(uint8_t reg, uint8_t mask) {
+ MFRC522_WriteRegister(reg, MFRC522_ReadRegister(reg) & (~mask));
+}
+void MFRC522_Reset(void) {
+ MFRC522_WriteRegister(MFRC522_REG_COMMAND, PCD_RESETPHASE);
+
+}
+void MFRC522_AntennaOn(void) {
+ uint8_t temp = MFRC522_ReadRegister(MFRC522_REG_TX_CONTROL);
+ if (!(temp & 0x03)) {
+ MFRC522_SetBitMask(MFRC522_REG_TX_CONTROL, 0x03);
+ }
+}
+void MFRC522_Init(void) {
+ // Set RST_PIN as output
+ DDRD |= (1 << RST_PIN);
+
+ // Reset the MFRC522
+ PORTD &= ~(1 << RST_PIN);
+ _delay_ms(1);
+ PORTD |= (1 << RST_PIN);
+ _delay_ms(50);
+
+ MFRC522_Reset();
+
+ // Timer: TPrescaler * TReloadVal / 6.78MHz = 24ms
+ MFRC522_WriteRegister(MFRC522_REG_T_MODE, 0x8D);
+ MFRC522_WriteRegister(MFRC522_REG_T_PRESCALER, 0x3E);
+ MFRC522_WriteRegister(MFRC522_REG_T_RELOAD_L, 30);
+ MFRC522_WriteRegister(MFRC522_REG_T_RELOAD_H, 0);
+
+ MFRC522_WriteRegister(MFRC522_REG_TX_AUTO, 0x40);
+ MFRC522_WriteRegister(MFRC522_REG_MODE, 0x3D);
+
+ MFRC522_AntennaOn();
+}
+uint8_t MFRC522_Request(uint8_t reqMode, uint8_t *TagType) {
+ uint8_t status;
+ uint16_t backBits;
+
+ MFRC522_WriteRegister(MFRC522_REG_BIT_FRAMING, 0x07);
+
+ TagType[0] = reqMode;
+ status = MFRC522_ToCard(PCD_TRANSCEIVE, TagType, 1, TagType, &backBits);
+
+ if ((status != MI_OK) || (backBits != 0x10)) {
+ status = MI_ERR;
+ }
+
+ return status;
+}
+uint8_t MFRC522_ToCard(uint8_t command, uint8_t *sendData, uint8_t sendLen, uint8_t *backData,
+uint16_t *backLen) {
+ uint8_t status = MI_ERR;
+ uint8_t irqEn = 0x00;
+ uint8_t waitIRq = 0x00;
+ uint8_t lastBits;
+ uint8_t n;
+ uint16_t i;
+
+ switch (command) {
+ case PCD_AUTHENT:
+ irqEn = 0x12;
+ waitIRq = 0x10;
+ break;
+ case PCD_TRANSCEIVE:
+ irqEn = 0x77;
+ waitIRq = 0x30;
+ break;
+ default:
+ break;
+ }
+
+ MFRC522_WriteRegister(MFRC522_REG_COMM_IE_N, irqEn | 0x80);
+ MFRC522_ClearBitMask(MFRC522_REG_COMM_IRQ, 0x80);
+ MFRC522_SetBitMask(MFRC522_REG_FIFO_LEVEL, 0x80);
+ MFRC522_WriteRegister(MFRC522_REG_COMMAND, PCD_IDLE);
+
+ for (i = 0; i < sendLen; i++) {
+ MFRC522_WriteRegister(MFRC522_REG_FIFO_DATA, sendData[i]);
+ }
+
+ MFRC522_WriteRegister(MFRC522_REG_COMMAND, command);
+ if (command == PCD_TRANSCEIVE) {
+ MFRC522_SetBitMask(MFRC522_REG_BIT_FRAMING, 0x80);
+ }
+
+ i = 2000;
+ do {
+ n = MFRC522_ReadRegister(MFRC522_REG_COMM_IRQ);
+ i--;
+ } while ((i != 0) && !(n & 0x01) && !(n & waitIRq));
+
+ MFRC522_ClearBitMask(MFRC522_REG_BIT_FRAMING, 0x80);
+
+ if (i != 0) {
+ if (!(MFRC522_ReadRegister(MFRC522_REG_ERROR) & 0x1B)) {
+ status = MI_OK;
+ if (n & irqEn & 0x01) {
+ status = MI_NOTAGERR;
+ }
+
+ if (command == PCD_TRANSCEIVE) {
+ n = MFRC522_ReadRegister(MFRC522_REG_FIFO_LEVEL);
+ lastBits = MFRC522_ReadRegister(MFRC522_REG_CONTROL) & 0x07;
+ if (lastBits) {
+ *backLen = (n - 1) * 8 + lastBits;
+ } else {
+ *backLen = n * 8;
+ }
+
+ if (n == 0) n = 1;
+ if (n > 16) n = 16;
+
+ for (i = 0; i < n; i++) {
+ backData[i] = MFRC522_ReadRegister(MFRC522_REG_FIFO_DATA);
+ }
+ }
+ } else {
+ status = MI_ERR;
+ }
+ }
+
+ return status;
+}
+uint8_t MFRC522_Anticoll(uint8_t *serNum) {
+ uint8_t status;
+ uint8_t i;
+ uint8_t serNumCheck = 0;
+ uint16_t unLen;
+
+ MFRC522_WriteRegister(MFRC522_REG_BIT_FRAMING, 0x00);
+
+ serNum[0] = PICC_ANTICOLL;
+ serNum[1] = 0x20;
+ status = MFRC522_ToCard(PCD_TRANSCEIVE, serNum, 2, serNum, &unLen);
+
+ if (status == MI_OK) {
+ for (i = 0; i < 4; i++) {
+ serNumCheck ^= serNum[i];
+ }
+ if (serNumCheck != serNum[i]) {
+ status = MI_ERR;
+ }
+ }
+
+ return status;
+}
+uint8_t checkRFID(void) {
+ uint8_t status;
+ uint8_t str[16];
+ uint8_t uid[5];
+
+ // Check for RFID card
+ status = MFRC522_Request(PICC_CMD_REQA, str);
+ if (status == MI_OK) {
+ status = MFRC522_Anticoll(uid);
+ if (status == MI_OK) {
+ // Check if it's your specific tag (correct)
+ if (uid[0] == YOUR_TAG_UID_0 &&
+ uid[1] == YOUR_TAG_UID_1 &&
+ uid[2] == YOUR_TAG_UID_2 &&
+ uid[3] == YOUR_TAG_UID_3) {
+ return 1; // Success - Correct Tag
+ }
+ // Check if it's the wrong card
+ else if (uid[0] == WRONG_CARD_UID_0 &&
+ uid[1] == WRONG_CARD_UID_1 &&
+ uid[2] == WRONG_CARD_UID_2 &&
+ uid[3] == WRONG_CARD_UID_3) {
+ return 2; // Wrong Card
+ }
+ else {
+ return 3; // Unknown RFID
+
+ }
+ }
+ }
+
+ return 0; // No RFID detected
+}
+// Buzzer functions
+void buzzer_on(void) {
+ LED_PORT |= (1 << BUZZER); // Turn on buzzer
+}
+void buzzer_off(void) {
+ LED_PORT &= ~(1 << BUZZER); // Turn off buzzer
+}
+// Solenoid control function (INVERTED LOGIC) - CHANGED TO PD4
+void controlSolenoid(uint8_t state) {
+ if (state) {
+ SOLENOID_PORT &= ~(1 << SOLENOID_PIN); // Solenoid OFF (Unlock)
+ } else {
+ SOLENOID_PORT |= (1 << SOLENOID_PIN); // Solenoid ON (Lock)
+ }
+}
+// Exit button functions
+void initExitButton(void) {
+ // Set PB0 as input with pull-up
+ EXIT_BUTTON_DDR &= ~(1 << EXIT_BUTTON_PIN);
+
+ EXIT_BUTTON_PORT |= (1 << EXIT_BUTTON_PIN);
+}
+uint8_t isExitButtonPressed(void) {
+ // Button is pressed when pin is low (pull-up resistor)
+ if (!(EXIT_BUTTON_PIN_REG & (1 << EXIT_BUTTON_PIN))) {
+ _delay_ms(20); // Debounce delay
+ if (!(EXIT_BUTTON_PIN_REG & (1 << EXIT_BUTTON_PIN))) {
+ return 1; // Button is pressed
+ }
+ }
+ return 0; // Button is not pressed
+}
+void handleExitButton(void) {
+ // Display exit message
+ displayExitMessage();
+
+ // Turn on yellow LED
+ LED_PORT |= (1 << YELLOW_LED);
+ LED_PORT &= ~(1 << RED_LED);
+
+ // Unlock the solenoid for 3 seconds
+ controlSolenoid(1); // Unlock
+ _delay_ms(3000);
+ controlSolenoid(0); // Lock again
+
+ // Turn off yellow LED
+ LED_PORT &= ~(1 << YELLOW_LED);
+
+ // Return to previous display
+ if (pin_authenticated) {
+ displayRFIDScan();
+ } else {
+ displayEnterPin();
+ }
+}
+int main(void) {
+ // Initialize I2C, LCD, Keypad, and SPI
+ I2C_init();
+ LCD_init();
+ keypad_init();
+ initSPI();
+ MFRC522_Init();
+ initExitButton();
+
+ // Initialize LED and buzzer pins as outputs
+ LED_DDR |= (1 << RED_LED) | (1 << YELLOW_LED) | (1 << BUZZER);
+ LED_PORT &= ~((1 << RED_LED) | (1 << YELLOW_LED) | (1 << BUZZER)); // Start with LEDs and buzzer
+off
+
+ // Initialize Solenoid pin as output and start in locked state - CHANGED TO PD4
+ SOLENOID_DDR |= (1 << SOLENOID_PIN);
+ controlSolenoid(0); // Lock the door initially
+
+ // Display initial message
+ displayEnterPin();
+
+ char key = 0;
+ uint8_t pin_length = 0;
+ char pin[7] = ""; // Store up to 6 characters plus null terminator
+
+ while (1) {
+ // Check exit button first (has highest priority)
+ if (isExitButtonPressed()) {
+ handleExitButton();
+ // Wait for button release
+ while (isExitButtonPressed()) {
+ _delay_ms(10);
+ }
+ continue;
+ }
+
+ if (!pin_authenticated) {
+ // PIN authentication phase
+ key = keypad_getkey();
+
+ if (system_locked) {
+ // System is locked, display message
+ displaySystemLocked();
+ system_locked = 0; // Reset after displaying
+ failed_keypad_attempts = 0;
+ displayEnterPin();
+ continue;
+ }
+ if (key) {
+ // Process numeric keys (0-9) and letter keys (A-D)
+ if (((key >= '0' && key <= '9') || (key >= 'A' && key <= 'D')) && pin_length < 6) {
+ // Add the character to the PIN
+ pin[pin_length] = key;
+ pin_length++;
+ pin[pin_length] = '\0'; // Null terminate
+
+ // Clear the second line when starting
+ if (pin_length == 1) {
+ LCD_setCursor(0, 1);
+ LCD_print(" "); // 6 spaces for 6 characters
+ }
+
+ // Display the new character at the current position
+ LCD_setCursor(pin_length - 1, 1);
+ LCD_data(key);
+
+ // After a brief delay, convert to asterisk
+ _delay_ms(500); // Show the character for 500ms
+ LCD_setCursor(pin_length - 1, 1);
+ LCD_data('*');
+ }
+ // Handle submit key (#)
+ else if (key == '#') {
+ // Submit the PIN if # is pressed
+ if (pin_length == 6) {
+ // Compare entered PIN with correct PIN
+ if (strcmp(pin, correct_pin) == 0) {
+
+ // Correct PIN - turn on yellow LED
+ LED_PORT |= (1 << YELLOW_LED); // Turn on yellow LED
+ LED_PORT &= ~(1 << RED_LED); // Turn off red LED
+ buzzer_off(); // Ensure buzzer is off
+
+ displayAccessGranted();
+ failed_keypad_attempts = 0; // Reset failed attempts
+ pin_authenticated = 1; // Move to RFID authentication
+ failed_rfid_attempts = 0; // Reset RFID attempts
+ displayRFIDScan();
+ } else {
+ // Wrong PIN - turn on red LED and buzzer
+ failed_keypad_attempts++;
+ LED_PORT |= (1 << RED_LED); // Turn on red LED
+ LED_PORT &= ~(1 << YELLOW_LED); // Turn off yellow LED
+ buzzer_on(); // Turn on buzzer
+
+ displayWrongPassword(failed_keypad_attempts);
+
+ // Turn off buzzer after display
+ buzzer_off();
+
+ if (failed_keypad_attempts >= 3) {
+ system_locked = 1; // Lock the system
+ }
+ }
+
+ // Reset PIN buffer
+ pin_length = 0;
+ pin[0] = '\0';
+ if (!pin_authenticated) displayEnterPin();
+ }
+ }
+ // Handle clear key (*)
+ else if (key == '*') {
+ // Clear the PIN if * is pressed
+ if (pin_length > 0) {
+ pin_length = 0;
+ pin[0] = '\0';
+ LCD_setCursor(0, 1);
+ LCD_print(" "); // Clear the PIN display (6 spaces)
+ }
+ }
+ }
+ } else {
+ // RFID authentication phase
+ uint8_t rfid_status = checkRFID();
+
+ if (rfid_status == 1) {
+ // RFID authentication successful (Correct Tag) - turn on yellow LED
+ LED_PORT |= (1 << YELLOW_LED); // Turn on yellow LED
+ LED_PORT &= ~(1 << RED_LED); // Turn off red LED
+ buzzer_off(); // Turn off buzzer
+
+ // UNLOCK THE SOLENOID FOR 3 SECONDS
+ controlSolenoid(1); // Unlock
+ displayRFIDSuccess();
+ _delay_ms(3000); // Keep unlocked for 3 seconds
+ controlSolenoid(0); // Lock again
+
+ // Reset for next authentication cycle
+ pin_authenticated = 0;
+ failed_rfid_attempts = 0;
+ LED_PORT &= ~(1 << YELLOW_LED); // Turn off yellow LED
+ displayEnterPin();
+ } else if (rfid_status == 2 || rfid_status == 3) {
+ // Wrong Card or Unknown RFID detected - turn on red LED and buzzer
+ failed_rfid_attempts++;
+ LED_PORT |= (1 << RED_LED); // Turn on red LED
+ LED_PORT &= ~(1 << YELLOW_LED); // Turn off yellow LED
+ buzzer_on(); // Turn on buzzer
+
+ if (rfid_status == 2) {
+ displayWrongCard();
+ } else {
+ displayWrongRFID();
+ }
+
+ // Turn off buzzer after display
+ buzzer_off();
+
+ // Update the attempts display
+ displayRFIDScan();
+
+ if (failed_rfid_attempts >= 3) {
+ // Too many failed RFID attempts
+ LCD_clear();
+ LCD_setCursor(0, 0);
+ LCD_print("RFID LOCKED!");
+ LCD_setCursor(0, 1);
+ LCD_print("Message Sent");
+ _delay_ms(3000);
+
+ // Reset to PIN authentication
+ pin_authenticated = 0;
+ failed_rfid_attempts = 0;
+ LED_PORT &= ~(1 << RED_LED); // Turn off red LED
+ buzzer_off(); // Turn off buzzer
+ displayEnterPin();
+ }
+ }
+
+ _delay_ms(100); // Small delay between RFID checks
+ }
+
+ _delay_ms(10);
+ }
+
+ return 0;
+}
